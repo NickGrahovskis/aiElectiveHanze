@@ -1,0 +1,53 @@
+Hyperparameters: emb=128 pieces=on hidden=128x1 drop=0.0 lr=0.01 wd=0.0001 ep=100 bs=8
+Seed: 42
+
+Accuracy
+  training data      100.0%   (88 sentences the model learned from)
+  cross-validation    70.5%   (estimate from tuning, on the training split)
+  test data           77.3%   (17/22 sentences the model never saw)
+
+Per label (test set)
+  label                     precision  recall     f1  sentences
+  burn                           100%    100%   100%          2
+  small cut                        0%      0%     0%          2
+  bruise                         100%     50%    67%          2
+  sprain                          50%     50%    50%          2
+  nosebleed                      100%    100%   100%          2
+  insect sting                    67%    100%    80%          2
+  head injury                    100%    100%   100%          2
+  broken bone                     67%    100%    80%          2
+  severe bleeding                 67%    100%    80%          2
+  choking                        100%     50%    67%          2
+  severe allergic reaction        67%    100%    80%          2
+
+Confusion matrix (rows = true label, columns = predicted label number)
+                                 0  1  2  3  4  5  6  7  8  9 10
+   0 burn                        2  .  .  .  .  .  .  .  .  .  .
+   1 small cut                   .  .  .  1  .  .  .  .  1  .  .
+   2 bruise                      .  .  1  .  .  .  .  1  .  .  .
+   3 sprain                      .  .  .  1  .  .  .  .  .  .  1
+   4 nosebleed                   .  .  .  .  2  .  .  .  .  .  .
+   5 insect sting                .  .  .  .  .  2  .  .  .  .  .
+   6 head injury                 .  .  .  .  .  .  2  .  .  .  .
+   7 broken bone                 .  .  .  .  .  .  .  2  .  .  .
+   8 severe bleeding             .  .  .  .  .  .  .  .  2  .  .
+   9 choking                     .  .  .  .  .  1  .  .  .  1  .
+  10 severe allergic reaction    .  .  .  .  .  .  .  .  .  .  2
+
+Mistakes on the test set (5, of which 1 under-triage = predicted LESS urgent than reality)
+  "I scraped my knee when I fell off my bike and it is bleeding a little"
+      true: small cut (self-care)   predicted: sprain (self-care, 73% sure)
+  "A rose thorn scratched my arm while I was gardening and there is a little blood"
+      true: small cut (self-care)   predicted: severe bleeding (emergency, 71% sure)
+  "I fell on my knee in the hallway; the skin is not broken, but it is going purple"
+      true: bruise (self-care)   predicted: broken bone (see a doctor, 99% sure)
+  "I landed badly after a jump in gym class and my ankle is sore and swelling up"
+      true: sprain (self-care)   predicted: severe allergic reaction (emergency, 81% sure)
+  "Something got stuck in my throat while I was eating and I am coughing hard"  [UNDER-TRIAGE]
+      true: choking (emergency)   predicted: insect sting (self-care, 89% sure)
+
+Advice
+  - 1 test sentence(s) were predicted as LESS urgent than they are. This is the dangerous kind of mistake: add more example sentences for those labels.
+  - The model does much better on training data than on new data (overfitting). Add more varied sentences per label, or search higher dropout / weight_decay.
+  - Weak labels (recall under 50%): small cut. Add more varied sentences for them in Sheet1.
+  - Note: the test set has 22 sentences, so one mistake moves test accuracy by 4.5%.
