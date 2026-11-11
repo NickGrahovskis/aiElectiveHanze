@@ -9,7 +9,7 @@ import argparse
 import textwrap
 from pathlib import Path
 
-from firstaid.backends import DEFAULT_CHECKPOINT, Classifier, GeminiClassifier, LocalClassifier, Prediction
+from firstaid.backends import DEFAULT_CHECKPOINT, Classifier, LocalClassifier, Prediction
 from firstaid.data import DEFAULT_WORKBOOK, Guidance, load_dataset
 
 DISCLAIMER = ("Educational prototype only. This is not medical advice and does not replace a doctor.\n"
@@ -22,20 +22,19 @@ CAUTION_PROBABILITY = 0.15  # mention a more urgent runner-up label if it is at 
 
 
 def main() -> None:
-    args = parse_args()
-    dataset = load_dataset(args.data)
-    classifier = load_classifier(args.backend, args.checkpoint, dataset.labels)
+    options = parse_args()
+    dataset = load_dataset(options.data)
+    classifier = load_classifier(options.checkpoint)
 
-    if args.message:
-        print_answer(args.message, classifier, dataset.guidance, args)
+    if options.message:
+        print_answer(options.message, classifier, dataset.guidance, options)
         return
-    chat_loop(classifier, dataset.guidance, args)
+    chat_loop(classifier, dataset.guidance, options)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("message", nargs="?", help="answer this one message and exit")
-    parser.add_argument("--backend", choices=["local", "gemini"], default="local")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--data", type=Path, default=DEFAULT_WORKBOOK)
     parser.add_argument("--min-confidence", type=float, default=0.5,
@@ -46,24 +45,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_classifier(backend: str, checkpoint: Path, labels: list[str]) -> Classifier:
-    """The chosen backend, or a clean exit with the reason if it cannot be loaded."""
+def load_classifier(checkpoint: Path) -> Classifier:
+    """The trained model, or a clean exit with the reason if it cannot be loaded."""
     print("Loading model...")
     try:
-        return build_classifier(backend, checkpoint, labels)
-    except (FileNotFoundError, NotImplementedError) as error:
+        return LocalClassifier(checkpoint)
+    except FileNotFoundError as error:
         raise SystemExit(str(error))
-
-
-def build_classifier(backend: str, checkpoint: Path, labels: list[str]) -> Classifier:
-    if backend == "gemini":
-        return GeminiClassifier(labels)
-    return LocalClassifier(checkpoint)
 
 
 # ---- the conversation ----
 
-def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], args: argparse.Namespace) -> None:
+def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], options: argparse.Namespace) -> None:
     """Answer messages until the user types 'quit' or presses Ctrl+C / Ctrl+D."""
     print(f"\nFirst-aid assistant\n{DISCLAIMER}\n{HELP}")
     while True:
@@ -77,7 +70,7 @@ def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], args: argpa
         if text.lower() in HELP_WORDS:
             print(HELP)
             continue
-        print_answer(text, classifier, guidance, args)
+        print_answer(text, classifier, guidance, options)
     print("Take care. In an emergency call 112.")
 
 
@@ -91,9 +84,9 @@ def read_message() -> str | None:
 
 
 def print_answer(text: str, classifier: Classifier, guidance: dict[str, Guidance],
-                 args: argparse.Namespace) -> None:
+                 options: argparse.Namespace) -> None:
     prediction = classifier.predict(text)
-    reply = format_answer(prediction, guidance, args.min_confidence, args.min_known_words)
+    reply = format_answer(prediction, guidance, options.min_confidence, options.min_known_words)
     print("\n" + textwrap.indent(reply, "  "))
 
 
@@ -110,7 +103,7 @@ def format_answer(prediction: Prediction, guidance: dict[str, Guidance],
 
 
 def is_off_topic(prediction: Prediction, min_known_words: float) -> bool:
-    """Too few of the message's words appeared in training. A backend that cannot tell (None) is never off-topic."""
+    """Too few of the message's words appeared in training. If it is unknown (None), the message is never treated as off-topic."""
     if prediction.known_words is None:
         return False
     return prediction.known_words < min_known_words
