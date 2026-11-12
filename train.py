@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", type=Path, default=DEFAULT_WORKBOOK, help="the scenarios workbook")
     parser.add_argument("--out", type=Path, default=PROJECT_DIR / "artifacts", help="where to save the model and report")
-    parser.add_argument("--trials", type=int, default=15, help="hyperparameter combinations to try")
+    parser.add_argument("--trials", type=int, default=20, help="hyperparameter combinations to try")
     parser.add_argument("--folds", type=int, default=4, help="cross-validation folds")
     parser.add_argument("--seed", type=int, default=42, help="random seed (same seed = same result)")
     parser.add_argument("--no-tune", action="store_true", help="skip tuning and use the default hyperparameters")

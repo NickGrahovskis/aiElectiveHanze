@@ -41,6 +41,21 @@ python -m venv .venv
 
 The first run with mpnet downloads about 420 MB (cached afterwards).
 
+## Running (every new terminal)
+
+Activate the project environment before running anything. If the prompt starts with `(base)`
+(Anaconda), leave it first, otherwise `python` is Anaconda's and fails with
+`ModuleNotFoundError: No module named 'sklearn'`:
+
+```powershell
+conda deactivate
+.\.venv\Scripts\Activate.ps1
+python train.py
+```
+
+The prompt should now start with `(.venv)`. Without activating, `.\.venv\Scripts\python.exe train.py`
+works too.
+
 ## Commands
 
 ```powershell
