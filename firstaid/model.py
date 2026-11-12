@@ -1,9 +1,4 @@
 """Step 2: the neural network, trained completely from scratch.
-
-    token IDs of a sentence (from vocabulary.py)
-        -> EmbeddingBag: looks up a learned vector (embedding_dim numbers) per ID and averages them
-           = the sentence embedding
-           (with mpnet instead: the sentence's mpnet vector, 768 fixed numbers, see mpnet.py)
         -> Linear (weights W1, biases b1) -> ReLU -> Dropout     } repeated num_hidden_layers times
         -> Linear (weights W2, biases b2)
         -> one score (logit) per label; softmax turns them into probabilities
@@ -23,15 +18,18 @@ from . import mpnet
 
 class FirstAidNet(nn.Module):
     def __init__(self, vocab_size: int, num_classes: int, embedding_dim: int = 64, hidden_size: int = 64,
-                 num_hidden_layers: int = 1, dropout: float = 0.2, use_mpnet: bool = False):
+                 num_hidden_layers: int = 1, dropout: float = 0.2, use_mpnet: bool = False,
+                 use_own_embeddings: bool = False):
         super().__init__()
-        if use_mpnet:
-            # The sentence embeddings come from mpnet and stay fixed, so there is no embedding layer to learn.
-            self.embedding = None
-            input_size = mpnet.DIM
-        else:
+        self.use_mpnet = use_mpnet
+        self.embedding = None
+        input_size = 0
+        if use_own_embeddings or not use_mpnet:
             self.embedding = nn.EmbeddingBag(vocab_size, embedding_dim, mode="mean")
-            input_size = embedding_dim
+            input_size += embedding_dim
+        if use_mpnet:
+            # Fixed meaning from mpnet: copes with wordings never seen in training.
+            input_size += mpnet.DIM
 
         self.layers = _build_layers(input_size, hidden_size, num_hidden_layers, dropout, num_classes)
         self.reset_parameters()
@@ -55,10 +53,12 @@ class FirstAidNet(nn.Module):
 
     def forward(self, token_ids: torch.Tensor, offsets: torch.Tensor,
                 mpnet_vectors: torch.Tensor | None = None) -> torch.Tensor:
-        """Scores per label. With mpnet, `mpnet_vectors` are the sentence embeddings and the IDs are not used."""
-        if self.embedding is None:
-            return self.layers(mpnet_vectors)
-        return self.layers(self.embed(token_ids, offsets))
+        parts = []
+        if self.embedding is not None:
+            parts.append(self.embed(token_ids, offsets))
+        if self.use_mpnet:
+            parts.append(mpnet_vectors)
+        return self.layers(torch.cat(parts, dim=1))
 
     def count_parameters(self) -> tuple[int, int]:
         """(number of weights, number of biases). Embedding vectors count as weights."""
@@ -122,6 +122,7 @@ def load_previous_model(path: Path) -> tuple[FirstAidNet, dict]:
         num_hidden_layers=hyperparams["num_hidden_layers"],
         dropout=hyperparams["dropout"],
         use_mpnet=hyperparams.get("mpnet", False),  # models saved before --mpnet existed have no "mpnet" entry
+        use_own_embeddings=hyperparams.get("own_embeddings", False),  # older mpnet models used mpnet only
     )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()

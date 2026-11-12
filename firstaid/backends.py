@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .data import PROJECT_DIR
 from .model import load_previous_model
-from .mpnet import load_mpnet
+from .mpnet import english_words, load_mpnet
+from .spelling import SpellingFixer
 from .training import TrainedModel, predict_proba
 from .vocabulary import Vocabulary
 
@@ -35,6 +36,10 @@ class Classifier(ABC):
     def predict(self, text: str) -> Prediction:
         """Classify a free-text description into one of the Sheet2 labels."""
 
+    def fix_spelling(self, text: str) -> str:
+        """The message with its typos fixed. This default changes nothing."""
+        return text
+
 
 class LocalClassifier(Classifier):
     """The network trained from scratch by train.py."""
@@ -49,11 +54,18 @@ class LocalClassifier(Classifier):
             mpnet = load_mpnet()
         self._model = TrainedModel(network, vocabulary, mpnet)
         self.labels = checkpoint["labels"]
+        self._spelling = None  # made on first use, so --no-fix-spelling never loads mpnet's word list
 
     def predict(self, text: str) -> Prediction:
         probabilities = predict_proba(self._model, [text])[0]
         ranked = _rank_labels(self.labels, probabilities)
         return Prediction(ranked, self._model.vocabulary.known_word_fraction(text))
+
+    def fix_spelling(self, text: str) -> str:
+        """Typos replaced by words from the training sentences (see spelling.py)."""
+        if self._spelling is None:
+            self._spelling = SpellingFixer(self._model.vocabulary, english_words())
+        return self._spelling.fix(text)
 
 
 def _rank_labels(labels: list[str], probabilities) -> list[tuple[str, float]]:

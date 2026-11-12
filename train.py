@@ -1,9 +1,10 @@
 """Train the first-aid classifier and print feedback.
 
-    python train.py                 # tune hyperparameters (40 trials), train, evaluate, save
-    python train.py --trials 80     # search harder
-    python train.py --no-tune       # skip tuning, use the default HyperParams
-    python train.py --no-mpnet      # learn the embeddings from your own sentences instead of using mpnet
+    python train.py                       # mpnet only (the default): tune hyperparameters (40 trials), train, evaluate, save
+    python train.py --trials 80           # search harder
+    python train.py --no-tune             # skip tuning, use the default HyperParams
+    python train.py --no-mpnet            # learn the embeddings from your own sentences instead of using mpnet
+    python train.py --own-embeddings      # mpnet + your own embeddings together (optional)
 """
 from __future__ import annotations
 
@@ -47,13 +48,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", type=Path, default=DEFAULT_WORKBOOK, help="the scenarios workbook")
     parser.add_argument("--out", type=Path, default=PROJECT_DIR / "artifacts", help="where to save the model and report")
-    parser.add_argument("--trials", type=int, default=40, help="hyperparameter combinations to try")
-    parser.add_argument("--folds", type=int, default=8, help="cross-validation folds")
+    parser.add_argument("--trials", type=int, default=15, help="hyperparameter combinations to try")
+    parser.add_argument("--folds", type=int, default=4, help="cross-validation folds")
     parser.add_argument("--seed", type=int, default=42, help="random seed (same seed = same result)")
     parser.add_argument("--no-tune", action="store_true", help="skip tuning and use the default hyperparameters")
     parser.add_argument("--mpnet", default=True, action=argparse.BooleanOptionalAction,
                         help="use the pre-trained mpnet sentence model from Hugging Face as the embeddings "
                              "(on by default; downloads ~420 MB the first time). --no-mpnet trains from scratch")
+    parser.add_argument("--own-embeddings", default=False, action=argparse.BooleanOptionalAction,
+                        help="with mpnet, ALSO learn embeddings from your own sentences (words + word pieces) and "
+                             "give the network both (off by default). Has no effect with --no-mpnet, which always "
+                             "uses your own embeddings.")
     return parser.parse_args()
 
 
@@ -93,7 +98,7 @@ def sentences_of(scenarios: list[Scenario], labels: list[str]) -> Sentences:
 def choose_hyperparams(train: Sentences, num_labels: int,
                        options: argparse.Namespace) -> tuple[HyperParams, list[TrialResult]]:
     """The best hyperparameters, and every trial tried (best first). No trials with --no-tune."""
-    defaults = HyperParams(mpnet=options.mpnet)
+    defaults = HyperParams(mpnet=options.mpnet, own_embeddings=options.own_embeddings)
     if options.no_tune:
         print("\n2) Tuning skipped (--no-tune), using the default hyperparameters")
         return defaults, []
@@ -137,17 +142,20 @@ def print_model_size(model: TrainedModel, hyperparams: HyperParams, num_labels: 
 
 
 def vocabulary_note(hyperparams: HyperParams) -> str:
-    """With mpnet the vocabulary does not feed the network; the chatbot still uses it to spot off-topic messages."""
-    if hyperparams.mpnet:
+    """With mpnet only, the vocabulary does not feed the network; the chatbot still uses it to spot off-topic messages."""
+    if hyperparams.mpnet and not hyperparams.own_embeddings:
         return " (only used to spot off-topic messages)"
     return ""
 
 
 def describe_inputs(model: TrainedModel, hyperparams: HyperParams) -> str:
-    """'embeddings (8,196 x 64)', or 'mpnet embeddings (768 fixed numbers)'."""
-    if hyperparams.mpnet:
-        return f"mpnet embeddings ({mpnet.DIM} fixed numbers)"
-    return f"embeddings ({len(model.vocabulary):,} x {hyperparams.embedding_dim})"
+    own = f"embeddings ({len(model.vocabulary):,} x {hyperparams.embedding_dim})"
+    from_mpnet = f"mpnet embeddings ({mpnet.DIM} fixed numbers)"
+    if not hyperparams.mpnet:
+        return own
+    if hyperparams.own_embeddings:
+        return f"{own} + {from_mpnet}"
+    return from_mpnet
 
 
 def describe_hidden_layers(hyperparams: HyperParams) -> str:

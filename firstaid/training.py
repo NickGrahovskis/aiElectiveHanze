@@ -18,7 +18,8 @@ from .vocabulary import Vocabulary
 class HyperParams:
     embedding_dim: int = 64         # numbers per learned embedding vector
     char_ngrams: bool = True        # also use 3-5 letter word pieces as features
-    mpnet: bool = False             # use mpnet's fixed sentence vectors instead of learned embeddings
+    mpnet: bool = False             # use mpnet's fixed sentence vectors
+    own_embeddings: bool = False    # with mpnet: also learn your own embeddings and use both side by side (off by default)
     hidden_size: int = 64           # neurons per hidden layer
     num_hidden_layers: int = 1      # how many hidden layers
     dropout: float = 0.2            # fraction of neurons switched off during training (fights overfitting)
@@ -26,23 +27,28 @@ class HyperParams:
     weight_decay: float = 1e-4      # pulls weights towards zero (fights overfitting)
     epochs: int = 100               # passes over the training data
     batch_size: int = 8             # sentences per weight update
+    label_smoothing: float = 0.1    # train towards 90% sure instead of 100% (fights overconfidence)
 
     def short(self) -> str:
         return (f"{self._short_embeddings()} "
                 f"hidden={self.hidden_size}x{self.num_hidden_layers} drop={self.dropout} "
-                f"lr={self.learning_rate:g} wd={self.weight_decay:g} ep={self.epochs} bs={self.batch_size}")
+                f"lr={self.learning_rate:g} wd={self.weight_decay:g} ep={self.epochs} bs={self.batch_size} "
+                f"smooth={self.label_smoothing:g}")
 
     def _short_embeddings(self) -> str:
-        if self.mpnet:
+        """'emb=64 pieces=on' (own only), 'emb=mpnet+64 pieces=on' (both) or 'emb=mpnet' (mpnet only)."""
+        if self.mpnet and not self.own_embeddings:
             return "emb=mpnet"
         pieces = "off"
         if self.char_ngrams:
             pieces = "on"
+        if self.mpnet:
+            return f"emb=mpnet+{self.embedding_dim} pieces={pieces}"
         return f"emb={self.embedding_dim} pieces={pieces}"
 
 
 # The values random_search() picks from. Edit these to widen or narrow the search.
-# With mpnet the first two are not used (mpnet provides the embeddings), so they are skipped.
+# With mpnet only (own_embeddings off) the first two are not used, so they are skipped.
 SEARCH_SPACE: dict[str, list] = {
     "embedding_dim": [32, 64, 128],
     "char_ngrams": [True, False],
@@ -104,7 +110,7 @@ def fit(texts: list[str], true_labels: np.ndarray, hyperparams: HyperParams, num
     model = TrainedModel(network, vocabulary, mpnet)
     optimizer = torch.optim.AdamW(network.parameters(), lr=hyperparams.learning_rate,
                                   weight_decay=hyperparams.weight_decay)
-    loss_function = nn.CrossEntropyLoss()
+    loss_function = nn.CrossEntropyLoss(label_smoothing=hyperparams.label_smoothing)
     shuffle_generator = torch.Generator().manual_seed(seed)
 
     for epoch in range(1, hyperparams.epochs + 1):
@@ -120,7 +126,8 @@ def fit(texts: list[str], true_labels: np.ndarray, hyperparams: HyperParams, num
 
 def _new_network(vocab_size: int, num_classes: int, hyperparams: HyperParams) -> FirstAidNet:
     return FirstAidNet(vocab_size, num_classes, hyperparams.embedding_dim, hyperparams.hidden_size,
-                       hyperparams.num_hidden_layers, hyperparams.dropout, hyperparams.mpnet)
+                       hyperparams.num_hidden_layers, hyperparams.dropout, hyperparams.mpnet,
+                       hyperparams.own_embeddings)
 
 
 def _mpnet_if_used(hyperparams: HyperParams) -> SentenceEncoder | None:
@@ -268,10 +275,10 @@ def _random_hyperparams(random_generator: random.Random, base: HyperParams) -> H
 
 
 def _searched(base: HyperParams) -> list[str]:
-    """The SEARCH_SPACE names worth trying: all of them, minus the embedding ones with mpnet."""
+    """The SEARCH_SPACE names worth trying: all of them, minus the embedding ones when only mpnet is used."""
     names = []
     for name in SEARCH_SPACE:
-        if base.mpnet and name in NOT_USED_WITH_MPNET:
+        if base.mpnet and not base.own_embeddings and name in NOT_USED_WITH_MPNET:
             continue
         names.append(name)
     return names

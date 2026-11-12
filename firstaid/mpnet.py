@@ -1,17 +1,4 @@
-"""A pre-trained sentence model from Hugging Face. train.py uses it by default; --no-mpnet turns it off.
-
-all-mpnet-base-v2 (Sentence Transformers) is a transformer: a large neural network that learned
-English from over a billion sentence pairs. It reads a whole sentence, word order included, and
-turns it into 768 numbers that stand for its meaning. Sentences that mean the same thing get similar
-numbers even when they share few words: "I burned my hand" and "my hand has a burn". With mpnet on,
-those numbers are the sentence embedding, instead of the embeddings learned from your sentences.
-
-These numbers are NOT learned from your sentences: they come from a downloaded model that stays
-fixed. The hidden layers on top of them are still trained from scratch.
-
-Source: https://huggingface.co/sentence-transformers/all-mpnet-base-v2 (about 420 MB, downloaded
-once and cached by huggingface_hub).
-"""
+"""A pre-trained sentence model from Hugging Face. train.py uses it by default; --no-mpnet turns it off. """
 from __future__ import annotations
 
 from functools import lru_cache
@@ -46,6 +33,22 @@ class SentenceEncoder:
             return
         for text, vector in zip(unseen_texts, self._model.encode(unseen_texts, show_progress_bar=False)):
             self._vectors[text] = vector
+
+
+@lru_cache(maxsize=1)
+def english_words() -> frozenset[str]:
+    """The whole words in mpnet's word list (about 30,000 English words: 'candle', 'honey', 'sure', ...).
+
+    spelling.py uses it to tell a real word from a typo. Loads only the small tokenizer files, not the model.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(REPO_ID, revision=REVISION)
+    words = set()
+    for token in tokenizer.get_vocab():
+        if token.isalpha():  # skips word pieces ('##ing'), numbers, punctuation and special tokens ('<mask>')
+            words.add(token)
+    return frozenset(words)
 
 
 @lru_cache(maxsize=1)
