@@ -14,7 +14,6 @@ class LabelScore:
     label: str
     precision: float    # when the model says this label, how often it is right
     recall: float       # of the sentences that really have this label, how many it found
-    f1: float           # precision and recall combined into one number
     sentences: int      # how many test sentences have this label
 
 
@@ -31,21 +30,23 @@ class Mistake:
         return self.guess.urgency_rank < self.truth.urgency_rank
 
 
-def feedback_report(probs: np.ndarray, y: np.ndarray, texts: list[str], labels: list[str],
+def feedback_report(probabilities: np.ndarray, true_labels: np.ndarray, texts: list[str], labels: list[str],
                     guidance: dict[str, Guidance], train_accuracy: float, train_size: int,
                     cv_accuracy: float | None) -> str:
     """Human-readable report on the test set: accuracy, per-label scores, confusions, mistakes, advice."""
-    predicted = probs.argmax(axis=1)
-    test_accuracy = float((predicted == y).mean())
-    scores = _score_each_label(y, predicted, labels)
-    mistakes = _find_mistakes(probs, y, texts, labels, guidance)
-    advice = _advice(mistakes, scores, train_accuracy, test_accuracy, cv_accuracy, len(y))
+    predicted_labels = probabilities.argmax(axis=1)
+    test_accuracy = float((predicted_labels == true_labels).mean())
+    scores = _score_each_label(true_labels, predicted_labels, labels)
+    mistakes = _find_mistakes(probabilities, true_labels, texts, labels, guidance)
+    test_size = len(true_labels)
+    test_correct = test_size - len(mistakes)
+    advice = _advice(mistakes, scores, train_accuracy, test_accuracy, cv_accuracy, test_size)
     width = _longest(labels)  # label column width, so the tables line up
 
     sections = [
-        _accuracy_section(train_accuracy, train_size, cv_accuracy, test_accuracy, len(y) - len(mistakes), len(y)),
+        _accuracy_section(train_accuracy, train_size, cv_accuracy, test_accuracy, test_correct, test_size),
         _per_label_section(scores, width),
-        _confusion_section(y, predicted, labels, width),
+        _confusion_section(true_labels, predicted_labels, labels, width),
         _mistakes_section(mistakes),
         _advice_section(advice),
     ]
@@ -54,25 +55,29 @@ def feedback_report(probs: np.ndarray, y: np.ndarray, texts: list[str], labels: 
 
 # ---- working out the numbers ----
 
-def _score_each_label(y: np.ndarray, predicted: np.ndarray, labels: list[str]) -> list[LabelScore]:
+def _score_each_label(true_labels: np.ndarray, predicted_labels: np.ndarray, labels: list[str]) -> list[LabelScore]:
     label_ids = list(range(len(labels)))
-    precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=label_ids,
-                                                                     zero_division=0)
+    precisions, recalls, _, sentence_counts = precision_recall_fscore_support(
+        true_labels, predicted_labels, labels=label_ids, zero_division=0)
     scores = []
-    for i, label in enumerate(labels):
-        scores.append(LabelScore(label, float(precision[i]), float(recall[i]), float(f1[i]), int(support[i])))
+    for label_number, label in enumerate(labels):
+        scores.append(LabelScore(label, float(precisions[label_number]), float(recalls[label_number]),
+                                 int(sentence_counts[label_number])))
     return scores
 
 
-def _find_mistakes(probs: np.ndarray, y: np.ndarray, texts: list[str], labels: list[str],
+def _find_mistakes(probabilities: np.ndarray, true_labels: np.ndarray, texts: list[str], labels: list[str],
                    guidance: dict[str, Guidance]) -> list[Mistake]:
-    predicted = probs.argmax(axis=1)
+    predicted_labels = probabilities.argmax(axis=1)
     mistakes = []
-    for i in range(len(y)):
-        if predicted[i] != y[i]:
-            truth = guidance[labels[y[i]]]
-            guess = guidance[labels[predicted[i]]]
-            mistakes.append(Mistake(texts[i], truth, guess, float(probs[i, predicted[i]])))
+    for sentence_number in range(len(true_labels)):
+        true_label = true_labels[sentence_number]
+        predicted_label = predicted_labels[sentence_number]
+        if predicted_label != true_label:
+            truth = guidance[labels[true_label]]
+            guess = guidance[labels[predicted_label]]
+            confidence = float(probabilities[sentence_number, predicted_label])
+            mistakes.append(Mistake(texts[sentence_number], truth, guess, confidence))
     return mistakes
 
 
@@ -134,29 +139,30 @@ def _accuracy_section(train_accuracy: float, train_size: int, cv_accuracy: float
 
 def _per_label_section(scores: list[LabelScore], width: int) -> list[str]:
     lines = ["Per label (test set)",
-             f"  {'label':<{width}}  precision  recall     f1  sentences"]
+             f"  {'label':<{width}}  precision  recall  sentences"]
     for score in scores:
         lines.append(f"  {score.label:<{width}}  {score.precision:9.0%}  {score.recall:6.0%}  "
-                     f"{score.f1:5.0%}  {score.sentences:9d}")
+                     f"{score.sentences:9d}")
     return lines
 
 
-def _confusion_section(y: np.ndarray, predicted: np.ndarray, labels: list[str], width: int) -> list[str]:
+def _confusion_section(true_labels: np.ndarray, predicted_labels: np.ndarray, labels: list[str],
+                       width: int) -> list[str]:
     """A table: row = true label, column = predicted label. The diagonal holds the correct answers."""
     label_ids = list(range(len(labels)))
-    matrix = confusion_matrix(y, predicted, labels=label_ids)
+    matrix = confusion_matrix(true_labels, predicted_labels, labels=label_ids)
     lines = ["Confusion matrix (rows = true label, columns = predicted label number)",
              " " * (width + 7) + _column_numbers(len(labels))]
-    for i, label in enumerate(labels):
-        lines.append(f"  {i:>2} {label:<{width}}  {_matrix_row(matrix[i])}")
+    for label_number, label in enumerate(labels):
+        lines.append(f"  {label_number:>2} {label:<{width}}  {_matrix_row(matrix[label_number])}")
     return lines
 
 
 def _column_numbers(count: int) -> str:
     """'  0  1  2 ...'"""
     header = ""
-    for i in range(count):
-        header += f"{i:>3}"
+    for column_number in range(count):
+        header += f"{column_number:>3}"
     return header
 
 

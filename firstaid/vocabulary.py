@@ -1,28 +1,18 @@
-"""Step 1a: turn text into numbers (token IDs) with a vocabulary built from YOUR training sentences.
+"""Step 1a: turn text into numbers (token IDs) with a vocabulary built from YOUR training sentences."""
 
-No pretrained model is used. Each sentence is split into features:
-    words            "burned", "my", "hand"
-    word pairs       "burned_my", "my_hand"            (keeps a little word order: "not_broken")
-    word pieces      "<bu", "bur", "urn", "rne", ...    (3-5 letters, optional)
-
-Word pieces let the model connect words it has never seen in full: "burned" and "burn" share
-"<bu", "bur", "urn". Every feature seen in the training sentences gets an ID; unseen features are
-ignored. The IDs then go into the network's embedding layer (model.py), which learns a vector of
-numbers for each one: those learned vectors are the embeddings.
-"""
 from __future__ import annotations
 
 import re
 
 from .data import clean_text
 
-_TOKEN = re.compile(r"[a-z0-9']+")
+_WORD_PATTERN = re.compile(r"[a-z0-9']+")
 PIECE_LENGTHS = (3, 4, 5)  # letters per word piece
 
 
 def words(text: str) -> list[str]:
     """'I burned my hand!' -> ['i', 'burned', 'my', 'hand']"""
-    return _TOKEN.findall(clean_text(text).lower())
+    return _WORD_PATTERN.findall(clean_text(text).lower())
 
 
 def features(text: str, char_ngrams: bool) -> list[str]:
@@ -93,17 +83,34 @@ class Vocabulary:
 
     def encode(self, text: str) -> list[int]:
         """Sentence -> IDs of its features. Features never seen in training are skipped."""
-        ids = []
+        feature_ids = []
         for feature in features(text, self.char_ngrams):
             if feature in self._index:
-                ids.append(self._index[feature])
-        return ids
+                feature_ids.append(self._index[feature])
+        return feature_ids
 
     def encode_all(self, texts: list[str]) -> list[list[int]]:
-        encoded = []
+        encoded_sentences = []
         for text in texts:
-            encoded.append(self.encode(text))
-        return encoded
+            encoded_sentences.append(self.encode(text))
+        return encoded_sentences
+
+    def known_words(self) -> list[str]:
+        """Every word that appeared in the training sentences."""
+        result = []
+        for item in self.items:
+            if item.startswith("w:"):
+                result.append(item[2:])
+        return result
+
+    def known_pairs(self) -> list[tuple[str, str]]:
+        """Every two-word pair that appeared in the training sentences: ('my', 'hand'), ..."""
+        result = []
+        for item in self.items:
+            if item.startswith("p:"):
+                first, second = item[2:].split("_")
+                result.append((first, second))
+        return result
 
     def known_word_fraction(self, text: str) -> float:
         """Share of the message's words that appeared in the training sentences (0.0 - 1.0)."""

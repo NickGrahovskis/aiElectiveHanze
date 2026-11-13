@@ -1,6 +1,4 @@
-"""Classifier backends. The chatbot only talks to the `Classifier` interface, so the local
-PyTorch model can later be swapped for (or backed up by) Gemini without touching chat.py.
-"""
+"""The classifier the chatbot uses: it loads the model that train.py saved and predicts labels with it."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -8,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .data import PROJECT_DIR
+from .model import load_previous_model
+from .mpnet import english_words, load_mpnet
+from .spelling import SpellingFixer
+from .training import TrainedModel, predict_proba
+from .vocabulary import Vocabulary
 
 DEFAULT_CHECKPOINT = PROJECT_DIR / "artifacts" / "model.pt"
 
@@ -33,6 +36,10 @@ class Classifier(ABC):
     def predict(self, text: str) -> Prediction:
         """Classify a free-text description into one of the Sheet2 labels."""
 
+    def fix_spelling(self, text: str) -> str:
+        """The message with its typos fixed. This default changes nothing."""
+        return text
+
 
 class LocalClassifier(Classifier):
     """The network trained from scratch by train.py."""
@@ -40,47 +47,31 @@ class LocalClassifier(Classifier):
     def __init__(self, checkpoint_path: Path = DEFAULT_CHECKPOINT):
         if not Path(checkpoint_path).exists():
             raise FileNotFoundError(f"No trained model at {checkpoint_path}. Run:  python train.py")
-        # Imported here so the Gemini backend does not need torch.
-        from .model import load_checkpoint
-        from .training import TrainedModel, predict_proba
-        from .vocabulary import Vocabulary
-
-        network, checkpoint = load_checkpoint(Path(checkpoint_path))
+        network, checkpoint = load_previous_model(Path(checkpoint_path))
         vocabulary = Vocabulary(checkpoint["vocabulary"], checkpoint["hyperparams"]["char_ngrams"])
-        self._model = TrainedModel(network, vocabulary)
-        self._predict_proba = predict_proba
+        mpnet = None
+        if checkpoint["hyperparams"].get("mpnet", False):  # the network was trained on mpnet vectors
+            mpnet = load_mpnet()
+        self._model = TrainedModel(network, vocabulary, mpnet)
         self.labels = checkpoint["labels"]
+        self._spelling = None  # made on first use, so --no-fix-spelling never loads mpnet's word list
 
     def predict(self, text: str) -> Prediction:
-        probs = self._predict_proba(self._model, [text])[0]
-        ranked = _rank_labels(self.labels, probs)
+        probabilities = predict_proba(self._model, [text])[0]
+        ranked = _rank_labels(self.labels, probabilities)
         return Prediction(ranked, self._model.vocabulary.known_word_fraction(text))
 
+    def fix_spelling(self, text: str) -> str:
+        """Typos replaced by words from the training sentences (see spelling.py)."""
+        if self._spelling is None:
+            self._spelling = SpellingFixer(self._model.vocabulary, english_words())
+        return self._spelling.fix(text)
 
-def _rank_labels(labels: list[str], probs) -> list[tuple[str, float]]:
+
+def _rank_labels(labels: list[str], probabilities) -> list[tuple[str, float]]:
     """Pair every label with its probability, most likely first."""
-    most_likely_first = probs.argsort()[::-1]
+    most_likely_first = probabilities.argsort()[::-1]
     ranked = []
-    for i in most_likely_first:
-        ranked.append((labels[i], float(probs[i])))
+    for label_number in most_likely_first:
+        ranked.append((labels[label_number], float(probabilities[label_number])))
     return ranked
-
-
-class GeminiClassifier(Classifier):
-    """Placeholder for a Gemini Flash-Lite backend. Not implemented yet.
-
-    To implement it:
-      1. pip install google-genai, and set the GEMINI_API_KEY environment variable.
-      2. In predict(), send a prompt that lists self.labels and the user's text, and asks for
-         exactly one label back (structured JSON output is the most reliable).
-      3. Check the answer is in self.labels and return Prediction([(label, 1.0)]).
-         known_words stays None; the chatbot then skips its "not a first-aid question" check.
-    Nothing else needs to change: chat.py --backend gemini will use it.
-    """
-
-    def __init__(self, labels: list[str]):
-        self.labels = labels
-        raise NotImplementedError("The Gemini backend is a placeholder. See GeminiClassifier in firstaid/backends.py.")
-
-    def predict(self, text: str) -> Prediction:
-        raise NotImplementedError

@@ -1,18 +1,7 @@
-"""Step 3: hyperparameters, training (adjusting weights and biases) and automatic tuning.
-
-Weights and biases are *learned*: each training step runs the network, measures how wrong it was
-(cross-entropy loss), computes the gradient of that loss for every weight and bias (backpropagation),
-and nudges them in the direction that lowers the loss (AdamW optimiser). This includes the
-embedding vectors, so the model learns its own embeddings from your sentences.
-
-Hyperparameters are *chosen*: embedding size, layer size, learning rate, etc. random_search() tries
-many combinations and scores each with k-fold cross-validation on the training split, so the test
-split stays unseen until the final check.
-"""
 from __future__ import annotations
 
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -21,6 +10,7 @@ from sklearn.model_selection import StratifiedKFold
 from torch import nn
 
 from .model import FirstAidNet, pack
+from .mpnet import SentenceEncoder, load_mpnet
 from .vocabulary import Vocabulary
 
 
@@ -28,6 +18,8 @@ from .vocabulary import Vocabulary
 class HyperParams:
     embedding_dim: int = 64         # numbers per learned embedding vector
     char_ngrams: bool = True        # also use 3-5 letter word pieces as features
+    mpnet: bool = False             # use mpnet's fixed sentence vectors
+    own_embeddings: bool = False    # with mpnet: also learn your own embeddings and use both side by side (off by default)
     hidden_size: int = 64           # neurons per hidden layer
     num_hidden_layers: int = 1      # how many hidden layers
     dropout: float = 0.2            # fraction of neurons switched off during training (fights overfitting)
@@ -35,17 +27,28 @@ class HyperParams:
     weight_decay: float = 1e-4      # pulls weights towards zero (fights overfitting)
     epochs: int = 100               # passes over the training data
     batch_size: int = 8             # sentences per weight update
+    label_smoothing: float = 0.1    # train towards 90% sure instead of 100% (fights overconfidence)
 
     def short(self) -> str:
+        return (f"{self._short_embeddings()} "
+                f"hidden={self.hidden_size}x{self.num_hidden_layers} drop={self.dropout} "
+                f"lr={self.learning_rate:g} wd={self.weight_decay:g} ep={self.epochs} bs={self.batch_size} "
+                f"smooth={self.label_smoothing:g}")
+
+    def _short_embeddings(self) -> str:
+        """'emb=64 pieces=on' (own only), 'emb=mpnet+64 pieces=on' (both) or 'emb=mpnet' (mpnet only)."""
+        if self.mpnet and not self.own_embeddings:
+            return "emb=mpnet"
         pieces = "off"
         if self.char_ngrams:
             pieces = "on"
-        return (f"emb={self.embedding_dim} pieces={pieces} "
-                f"hidden={self.hidden_size}x{self.num_hidden_layers} drop={self.dropout} "
-                f"lr={self.learning_rate:g} wd={self.weight_decay:g} ep={self.epochs} bs={self.batch_size}")
+        if self.mpnet:
+            return f"emb=mpnet+{self.embedding_dim} pieces={pieces}"
+        return f"emb={self.embedding_dim} pieces={pieces}"
 
 
-# Values random_search() picks from. Edit these to widen or narrow the search.
+# The values random_search() picks from. Edit these to widen or narrow the search.
+# With mpnet only (own_embeddings off) the first two are not used, so they are skipped.
 SEARCH_SPACE: dict[str, list] = {
     "embedding_dim": [32, 64, 128],
     "char_ngrams": [True, False],
@@ -57,6 +60,7 @@ SEARCH_SPACE: dict[str, list] = {
     "epochs": [50, 100, 200],
     "batch_size": [8, 16],
 }
+NOT_USED_WITH_MPNET = ("embedding_dim", "char_ngrams")
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,7 @@ class TrialResult:
 class TrainedModel:
     network: FirstAidNet
     vocabulary: Vocabulary
+    mpnet: SentenceEncoder | None = None    # None when the embeddings were learned from scratch
 
 
 def set_seed(seed: int) -> None:
@@ -85,65 +90,94 @@ def set_seed(seed: int) -> None:
 
 # ---- training: adjusting weights and biases ----
 
-def fit(texts: list[str], y: np.ndarray, hp: HyperParams, num_classes: int, seed: int = 42,
+def fit(texts: list[str], true_labels: np.ndarray, hyperparams: HyperParams, num_classes: int, seed: int = 42,
         log_every: int = 0) -> TrainedModel:
     """Build a vocabulary from `texts` and train a fresh network on them.
 
     With log_every > 0, print progress every N epochs.
     """
     set_seed(seed)
-    vocabulary = Vocabulary.build(texts, hp.char_ngrams)
-    encoded = vocabulary.encode_all(texts)
-    network = _new_network(len(vocabulary), num_classes, hp)
-    model = TrainedModel(network, vocabulary)
-    optimizer = torch.optim.AdamW(network.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay)
-    loss_fn = nn.CrossEntropyLoss()
-    targets = torch.from_numpy(y).long()
-    shuffle = torch.Generator().manual_seed(seed)
 
-    for epoch in range(1, hp.epochs + 1):
-        epoch_loss = _train_one_epoch(network, encoded, targets, optimizer, loss_fn, hp.batch_size, shuffle)
-        if _should_log(epoch, hp.epochs, log_every):
-            train_accuracy = accuracy(predict_proba(model, texts), y)
-            print(f"    epoch {epoch:4d}/{hp.epochs}   loss {epoch_loss:.4f}   train accuracy {train_accuracy:.1%}")
+    # The inputs: feature IDs per sentence, plus each sentence's mpnet vector when mpnet is used.
+    vocabulary = Vocabulary.build(texts, hyperparams.char_ngrams)
+    encoded_sentences = vocabulary.encode_all(texts)
+    mpnet = _mpnet_if_used(hyperparams)
+    mpnet_vectors = _mpnet_vectors(mpnet, texts)
+    true_labels_tensor = torch.from_numpy(true_labels).long()
+
+    # The network, and how it learns.
+    network = _new_network(len(vocabulary), num_classes, hyperparams)
+    model = TrainedModel(network, vocabulary, mpnet)
+    optimizer = torch.optim.AdamW(network.parameters(), lr=hyperparams.learning_rate,
+                                  weight_decay=hyperparams.weight_decay)
+    loss_function = nn.CrossEntropyLoss(label_smoothing=hyperparams.label_smoothing)
+    shuffle_generator = torch.Generator().manual_seed(seed)
+
+    for epoch in range(1, hyperparams.epochs + 1):
+        epoch_loss = _train_one_epoch(network, encoded_sentences, mpnet_vectors, true_labels_tensor,
+                                      optimizer, loss_function, hyperparams.batch_size, shuffle_generator)
+        if _should_log(epoch, hyperparams.epochs, log_every):
+            train_accuracy = accuracy(predict_proba(model, texts), true_labels)
+            print(f"    epoch {epoch:4d}/{hyperparams.epochs}   loss {epoch_loss:.4f}   "
+                  f"train accuracy {train_accuracy:.1%}")
     network.eval()
     return model
 
 
-def _new_network(vocab_size: int, num_classes: int, hp: HyperParams) -> FirstAidNet:
-    return FirstAidNet(vocab_size, num_classes, hp.embedding_dim, hp.hidden_size,
-                       hp.num_hidden_layers, hp.dropout)
+def _new_network(vocab_size: int, num_classes: int, hyperparams: HyperParams) -> FirstAidNet:
+    return FirstAidNet(vocab_size, num_classes, hyperparams.embedding_dim, hyperparams.hidden_size,
+                       hyperparams.num_hidden_layers, hyperparams.dropout, hyperparams.mpnet,
+                       hyperparams.own_embeddings)
 
 
-def _train_one_epoch(network: FirstAidNet, encoded: list[list[int]], targets: torch.Tensor,
-                     optimizer: torch.optim.Optimizer, loss_fn: nn.Module, batch_size: int,
-                     shuffle: torch.Generator) -> float:
+def _mpnet_if_used(hyperparams: HyperParams) -> SentenceEncoder | None:
+    if not hyperparams.mpnet:
+        return None
+    return load_mpnet()
+
+
+def _mpnet_vectors(mpnet: SentenceEncoder | None, texts: list[str]) -> torch.Tensor | None:
+    """Each sentence's mpnet vector (one row per sentence), or None without mpnet."""
+    if mpnet is None:
+        return None
+    return torch.tensor(mpnet.sentence_vectors(texts), dtype=torch.float32)
+
+
+def _train_one_epoch(network: FirstAidNet, encoded_sentences: list[list[int]], mpnet_vectors: torch.Tensor | None,
+                     true_labels_tensor: torch.Tensor, optimizer: torch.optim.Optimizer, loss_function: nn.Module,
+                     batch_size: int, shuffle_generator: torch.Generator) -> float:
     """One pass over all training sentences, in a new random order. Returns the average loss."""
     network.train()
-    order = torch.randperm(len(encoded), generator=shuffle).tolist()
+    shuffled_positions = torch.randperm(len(encoded_sentences), generator=shuffle_generator).tolist()
     total_loss = 0.0
-    for batch in _split_into_batches(order, batch_size):
-        batch_loss = _train_one_batch(network, _pick(encoded, batch), targets[batch], optimizer, loss_fn)
-        total_loss += batch_loss * len(batch)
-    return total_loss / len(encoded)
+    for batch_positions in _split_into_batches(shuffled_positions, batch_size):
+        batch_sentences = _pick(encoded_sentences, batch_positions)
+        batch_mpnet_vectors = _pick_rows(mpnet_vectors, batch_positions)
+        batch_true_labels = true_labels_tensor[batch_positions]
+        batch_loss = _train_one_batch(network, batch_sentences, batch_mpnet_vectors, batch_true_labels,
+                                      optimizer, loss_function)
+        total_loss += batch_loss * len(batch_positions)
+    return total_loss / len(encoded_sentences)
 
 
-def _train_one_batch(network: FirstAidNet, batch_encoded: list[list[int]], batch_targets: torch.Tensor,
-                     optimizer: torch.optim.Optimizer, loss_fn: nn.Module) -> float:
+def _train_one_batch(network: FirstAidNet, batch_sentences: list[list[int]],
+                     batch_mpnet_vectors: torch.Tensor | None, batch_true_labels: torch.Tensor,
+                     optimizer: torch.optim.Optimizer, loss_function: nn.Module) -> float:
     """One adjustment of all weights and biases. Returns the batch's loss."""
-    logits = network(*pack(batch_encoded))   # forward pass: scores per label
-    loss = loss_fn(logits, batch_targets)    # how wrong were we?
-    optimizer.zero_grad()
-    loss.backward()                          # gradient for every weight and bias
-    optimizer.step()                         # adjust weights and biases
+    token_ids, offsets = pack(batch_sentences)
+    label_scores = network(token_ids, offsets, batch_mpnet_vectors)  # forward pass: scores per label
+    loss = loss_function(label_scores, batch_true_labels)            # how wrong were we?
+    optimizer.zero_grad()                                            # forget the previous batch's gradients
+    loss.backward()                                                  # gradient for every weight and bias
+    optimizer.step()                                                 # adjust weights and biases
     return loss.item()
 
 
-def _split_into_batches(order: list[int], batch_size: int) -> list[list[int]]:
+def _split_into_batches(shuffled_positions: list[int], batch_size: int) -> list[list[int]]:
     """[5, 2, 8, 1, 0] with batch_size 2 -> [[5, 2], [8, 1], [0]]"""
     batches = []
-    for start in range(0, len(order), batch_size):
-        batches.append(order[start:start + batch_size])
+    for start in range(0, len(shuffled_positions), batch_size):
+        batches.append(shuffled_positions[start:start + batch_size])
     return batches
 
 
@@ -153,6 +187,13 @@ def _pick(items: list, positions) -> list:
     for position in positions:
         picked.append(items[position])
     return picked
+
+
+def _pick_rows(vectors: torch.Tensor | None, positions: list[int]) -> torch.Tensor | None:
+    """The rows at the given positions, or None when there are no vectors (no mpnet)."""
+    if vectors is None:
+        return None
+    return vectors[positions]
 
 
 def _should_log(epoch: int, total_epochs: int, log_every: int) -> bool:
@@ -168,65 +209,79 @@ def _should_log(epoch: int, total_epochs: int, log_every: int) -> bool:
 def predict_proba(model: TrainedModel, texts: list[str]) -> np.ndarray:
     """The probability of every label for every sentence: an array of shape (sentences, labels)."""
     model.network.eval()
-    logits = model.network(*pack(model.vocabulary.encode_all(texts)))
-    return torch.softmax(logits, dim=1).numpy()
+    token_ids, offsets = pack(model.vocabulary.encode_all(texts))
+    mpnet_vectors = _mpnet_vectors(model.mpnet, texts)
+    label_scores = model.network(token_ids, offsets, mpnet_vectors)
+    return torch.softmax(label_scores, dim=1).numpy()
 
 
-def accuracy(probs: np.ndarray, y: np.ndarray) -> float:
+def accuracy(probabilities: np.ndarray, true_labels: np.ndarray) -> float:
     """Share of sentences whose most likely label is the true label."""
-    return float((probs.argmax(axis=1) == y).mean())
+    return float((probabilities.argmax(axis=1) == true_labels).mean())
 
 
-def cross_entropy(probs: np.ndarray, y: np.ndarray) -> float:
+def cross_entropy(probabilities: np.ndarray, true_labels: np.ndarray) -> float:
     """Average of -log(probability given to the true label). Lower = more confident when right."""
-    true_label_probs = probs[np.arange(len(y)), y]
+    true_label_probs = probabilities[np.arange(len(true_labels)), true_labels]
     return float(-np.log(true_label_probs + 1e-12).mean())
 
 
 # ---- tuning: choosing hyperparameters ----
 
-def random_search(texts: list[str], y: np.ndarray, num_classes: int, trials: int = 40, folds: int = 4,
-                  seed: int = 42, on_trial: Callable[[int, int, TrialResult], None] | None = None) -> list[TrialResult]:
+def random_search(texts: list[str], true_labels: np.ndarray, num_classes: int, trials: int = 40, folds: int = 4,
+                  seed: int = 42, on_trial: Callable[[int, int, TrialResult], None] | None = None,
+                  base: HyperParams = HyperParams()) -> list[TrialResult]:
     """Try `trials` hyperparameter combinations; return them best first.
 
+    `base` gives the values of hyperparameters that are not in SEARCH_SPACE (such as mpnet).
     After each trial, on_trial(trial number, number of trials, result) is called if given.
     """
-    candidates = _pick_candidates(trials, seed)
+    candidates = _pick_candidates(trials, seed, base)
     results = []
-    for number, hp in enumerate(candidates, start=1):
-        result = cross_validate(texts, y, hp, num_classes, folds, seed)
+    for number, hyperparams in enumerate(candidates, start=1):
+        result = cross_validate(texts, true_labels, hyperparams, num_classes, folds, seed)
         results.append(result)
         if on_trial:
             on_trial(number, len(candidates), result)
     return sorted(results, key=_ranking)
 
 
-def _pick_candidates(trials: int, seed: int) -> list[HyperParams]:
-    """The defaults first (as a baseline), then random combinations from SEARCH_SPACE, no repeats."""
-    rng = random.Random(seed)
-    wanted = min(trials, _count_combinations())
-    candidates = [HyperParams()]
+def _pick_candidates(trials: int, seed: int, base: HyperParams) -> list[HyperParams]:
+    """`base` first (as a baseline), then random combinations from SEARCH_SPACE, no repeats."""
+    random_generator = random.Random(seed)
+    wanted = min(trials, _count_combinations(base))
+    candidates = [base]
     while len(candidates) < wanted:
-        hp = _random_hyperparams(rng)
-        if hp not in candidates:
-            candidates.append(hp)
+        hyperparams = _random_hyperparams(random_generator, base)
+        if hyperparams not in candidates:
+            candidates.append(hyperparams)
     return candidates
 
 
-def _count_combinations() -> int:
+def _count_combinations(base: HyperParams) -> int:
     """How many different combinations SEARCH_SPACE allows (3 x 2 x 3 x ...)."""
     total = 1
-    for values in SEARCH_SPACE.values():
-        total *= len(values)
+    for name in _searched(base):
+        total *= len(SEARCH_SPACE[name])
     return total
 
 
-def _random_hyperparams(rng: random.Random) -> HyperParams:
-    """A random value from SEARCH_SPACE for every hyperparameter."""
+def _random_hyperparams(random_generator: random.Random, base: HyperParams) -> HyperParams:
+    """A random value from SEARCH_SPACE for every searched hyperparameter; the rest come from `base`."""
     chosen = {}
-    for name, values in SEARCH_SPACE.items():
-        chosen[name] = rng.choice(values)
-    return HyperParams(**chosen)
+    for name in _searched(base):
+        chosen[name] = random_generator.choice(SEARCH_SPACE[name])
+    return replace(base, **chosen)
+
+
+def _searched(base: HyperParams) -> list[str]:
+    """The SEARCH_SPACE names worth trying: all of them, minus the embedding ones when only mpnet is used."""
+    names = []
+    for name in SEARCH_SPACE:
+        if base.mpnet and not base.own_embeddings and name in NOT_USED_WITH_MPNET:
+            continue
+        names.append(name)
+    return names
 
 
 def _ranking(result: TrialResult) -> tuple[float, float]:
@@ -234,7 +289,7 @@ def _ranking(result: TrialResult) -> tuple[float, float]:
     return -result.cv_accuracy, result.cv_loss
 
 
-def cross_validate(texts: list[str], y: np.ndarray, hp: HyperParams, num_classes: int,
+def cross_validate(texts: list[str], true_labels: np.ndarray, hyperparams: HyperParams, num_classes: int,
                    folds: int = 4, seed: int = 42) -> TrialResult:
     """Train on k-1 folds, validate on the remaining one, k times. Every label appears in every fold.
 
@@ -243,16 +298,20 @@ def cross_validate(texts: list[str], y: np.ndarray, hp: HyperParams, num_classes
     accuracies = []
     losses = []
     splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-    for train_idx, val_idx in splitter.split(np.zeros(len(y)), y):
-        fold_accuracy, fold_loss = _score_fold(texts, y, train_idx, val_idx, hp, num_classes, seed)
+    placeholder = np.zeros(len(true_labels))  # split() wants inputs too, but only looks at true_labels
+    for train_positions, validation_positions in splitter.split(placeholder, true_labels):
+        fold_accuracy, fold_loss = _score_fold(texts, true_labels, train_positions, validation_positions,
+                                               hyperparams, num_classes, seed)
         accuracies.append(fold_accuracy)
         losses.append(fold_loss)
-    return TrialResult(hp, float(np.mean(accuracies)), float(np.std(accuracies)), float(np.mean(losses)))
+    return TrialResult(hyperparams, float(np.mean(accuracies)), float(np.std(accuracies)), float(np.mean(losses)))
 
 
-def _score_fold(texts: list[str], y: np.ndarray, train_idx: np.ndarray, val_idx: np.ndarray,
-                hp: HyperParams, num_classes: int, seed: int) -> tuple[float, float]:
+def _score_fold(texts: list[str], true_labels: np.ndarray, train_positions: np.ndarray,
+                validation_positions: np.ndarray, hyperparams: HyperParams, num_classes: int,
+                seed: int) -> tuple[float, float]:
     """Train on one fold's training part; return (accuracy, loss) on its validation part."""
-    model = fit(_pick(texts, train_idx), y[train_idx], hp, num_classes, seed)
-    probs = predict_proba(model, _pick(texts, val_idx))
-    return accuracy(probs, y[val_idx]), cross_entropy(probs, y[val_idx])
+    model = fit(_pick(texts, train_positions), true_labels[train_positions], hyperparams, num_classes, seed)
+    probabilities = predict_proba(model, _pick(texts, validation_positions))
+    validation_true_labels = true_labels[validation_positions]
+    return accuracy(probabilities, validation_true_labels), cross_entropy(probabilities, validation_true_labels)

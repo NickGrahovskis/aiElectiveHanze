@@ -2,6 +2,7 @@
 
     python chat.py                                  # interactive chat
     python chat.py "I burned my hand on the oven"   # answer one message and exit
+    python chat.py --no-fix-spelling                # read messages exactly as typed (no typo fixing)
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import argparse
 import textwrap
 from pathlib import Path
 
-from firstaid.backends import DEFAULT_CHECKPOINT, Classifier, GeminiClassifier, LocalClassifier, Prediction
+from firstaid.backends import DEFAULT_CHECKPOINT, Classifier, LocalClassifier, Prediction
 from firstaid.data import DEFAULT_WORKBOOK, Guidance, load_dataset
 
 DISCLAIMER = ("Educational prototype only. This is not medical advice and does not replace a doctor.\n"
@@ -20,22 +21,33 @@ HELP_WORDS = {"help", "?"}
 TOP_GUESSES = 3             # how many of the most likely labels the bot looks at
 CAUTION_PROBABILITY = 0.15  # mention a more urgent runner-up label if it is at least this likely
 
+# Sheet2 labels that mean "I cannot name an injury". They are never shown as a diagnosis with an urgency:
+# the bot asks the guided question instead, however sure the model is.
+NOT_A_DIAGNOSIS = {"unknown", "clarification"}
+# The three things from the Use Case: what happened, where on the body, and what the person feels.
+GUIDED_QUESTION = ("To help you, please tell me three things:\n"
+                   "  1. What happened?  (e.g. touched something hot, fell, got stung, cut yourself)\n"
+                   "  2. Where on the body?  (e.g. hand, ankle, head, face)\n"
+                   "  3. What does the person feel?  (e.g. pain, swelling, bleeding, itching, "
+                   "trouble breathing)")
+CALL_112_SIGNS = ("If someone is not breathing, unconscious, bleeding heavily, has a swelling face or throat, "
+                  "chest pain or a seizure: call 112 now.")
+
 
 def main() -> None:
-    args = parse_args()
-    dataset = load_dataset(args.data)
-    classifier = load_classifier(args.backend, args.checkpoint, dataset.labels)
+    options = parse_args()
+    dataset = load_dataset(options.data)
+    classifier = load_classifier(options.checkpoint)
 
-    if args.message:
-        print_answer(args.message, classifier, dataset.guidance, args)
+    if options.message:
+        print_answer(options.message, classifier, dataset.guidance, options)
         return
-    chat_loop(classifier, dataset.guidance, args)
+    chat_loop(classifier, dataset.guidance, options)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("message", nargs="?", help="answer this one message and exit")
-    parser.add_argument("--backend", choices=["local", "gemini"], default="local")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--data", type=Path, default=DEFAULT_WORKBOOK)
     parser.add_argument("--min-confidence", type=float, default=0.5,
@@ -43,27 +55,24 @@ def parse_args() -> argparse.Namespace:
     # Measured: real injury messages had >= 73% known words, off-topic chat mostly <= 50%.
     parser.add_argument("--min-known-words", type=float, default=0.6,
                         help="below this share of words seen in training, the message is treated as off-topic")
+    parser.add_argument("--fix-spelling", default=True, action=argparse.BooleanOptionalAction,
+                        help="fix typos with words from the training sentences before the model reads them "
+                             "(on by default), e.g. 'my irm is brokem' -> 'my arm is broken'. See firstaid/spelling.py")
     return parser.parse_args()
 
 
-def load_classifier(backend: str, checkpoint: Path, labels: list[str]) -> Classifier:
-    """The chosen backend, or a clean exit with the reason if it cannot be loaded."""
+def load_classifier(checkpoint: Path) -> Classifier:
+    """The trained model, or a clean exit with the reason if it cannot be loaded."""
     print("Loading model...")
     try:
-        return build_classifier(backend, checkpoint, labels)
-    except (FileNotFoundError, NotImplementedError) as error:
+        return LocalClassifier(checkpoint)
+    except FileNotFoundError as error:
         raise SystemExit(str(error))
-
-
-def build_classifier(backend: str, checkpoint: Path, labels: list[str]) -> Classifier:
-    if backend == "gemini":
-        return GeminiClassifier(labels)
-    return LocalClassifier(checkpoint)
 
 
 # ---- the conversation ----
 
-def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], args: argparse.Namespace) -> None:
+def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], options: argparse.Namespace) -> None:
     """Answer messages until the user types 'quit' or presses Ctrl+C / Ctrl+D."""
     print(f"\nFirst-aid assistant\n{DISCLAIMER}\n{HELP}")
     while True:
@@ -77,7 +86,7 @@ def chat_loop(classifier: Classifier, guidance: dict[str, Guidance], args: argpa
         if text.lower() in HELP_WORDS:
             print(HELP)
             continue
-        print_answer(text, classifier, guidance, args)
+        print_answer(text, classifier, guidance, options)
     print("Take care. In an emergency call 112.")
 
 
@@ -91,46 +100,73 @@ def read_message() -> str | None:
 
 
 def print_answer(text: str, classifier: Classifier, guidance: dict[str, Guidance],
-                 args: argparse.Namespace) -> None:
+                 options: argparse.Namespace) -> None:
+    if options.fix_spelling:
+        text = fix_spelling(text, classifier)
     prediction = classifier.predict(text)
-    reply = format_answer(prediction, guidance, args.min_confidence, args.min_known_words)
+    reply = format_answer(prediction, guidance, options.min_confidence, options.min_known_words)
     print("\n" + textwrap.indent(reply, "  "))
+
+
+def fix_spelling(text: str, classifier: Classifier) -> str:
+    """The message with its typos fixed. If anything changed, show what the bot read, so a wrong fix is visible."""
+    fixed = classifier.fix_spelling(text)
+    if fixed != text:
+        print(f"\n  (read as: {fixed})")
+    return fixed
 
 
 # ---- the reply ----
 
 def format_answer(prediction: Prediction, guidance: dict[str, Guidance],
                   min_confidence: float, min_known_words: float) -> str:
-    """The bot's reply: off-topic, unsure (ask for more detail), or the first-aid steps."""
+    """The bot's reply: off-topic, unsure (ask the guided question), or the first-aid steps.
+    'unknown' and 'clarification' always get the unsure reply: they are not a diagnosis, so they get no urgency."""
     if is_off_topic(prediction, min_known_words):
         return off_topic_reply(guidance)
-    if prediction.confidence < min_confidence:
+    if prediction.label in NOT_A_DIAGNOSIS or prediction.confidence < min_confidence:
         return unsure_reply(prediction, guidance)
     return first_aid_reply(prediction, guidance)
 
 
 def is_off_topic(prediction: Prediction, min_known_words: float) -> bool:
-    """Too few of the message's words appeared in training. A backend that cannot tell (None) is never off-topic."""
+    """Too few of the message's words appeared in training. If it is unknown (None), the message is never treated as off-topic."""
     if prediction.known_words is None:
         return False
     return prediction.known_words < min_known_words
 
 
 def off_topic_reply(guidance: dict[str, Guidance]) -> str:
-    labels = ", ".join(guidance)
-    return (f"That does not sound like a situation I know about. I can help with: {labels}.\n"
-            "Please describe what happened. If someone is seriously hurt, call 112.")
+    return "\n".join([out_of_scope_line(guidance), GUIDED_QUESTION, CALL_112_SIGNS])
+
+
+def out_of_scope_line(guidance: dict[str, Guidance]) -> str:
+    labels = ", ".join(label for label in guidance if label not in NOT_A_DIAGNOSIS)
+    return (f"That does not sound like an injury I know about. I can help with: {labels}.\n"
+            "For other health problems contact a doctor or pharmacist.")
 
 
 def unsure_reply(prediction: Prediction, guidance: dict[str, Guidance]) -> str:
-    """Show the best guesses and ask for more detail. Warn first if any likely guess is an emergency."""
+    """No diagnosis: say why, then ask the guided question. Warn first if any likely guess is an emergency."""
     lines = []
     emergencies = likely_emergencies(prediction, guidance)
     if emergencies:
         lines.append(f"!!! If this could be {' or '.join(emergencies)}: CALL 112 NOW !!!")
-    lines.append(f"I'm not sure what happened. My best guesses: {best_guesses(prediction)}.")
-    lines.append("Can you describe it in more detail (what happened, where it hurts, how it looks)?")
+    lines.append(unsure_opening(prediction, guidance))
+    lines.append(GUIDED_QUESTION)
+    if not emergencies:
+        lines.append(CALL_112_SIGNS)
     return "\n".join(lines)
+
+
+def unsure_opening(prediction: Prediction, guidance: dict[str, Guidance]) -> str:
+    """Why the bot gives no first-aid steps: the message is out of scope, or it is too vague to tell."""
+    if prediction.label == "unknown":
+        return out_of_scope_line(guidance)
+    guesses = best_guesses(prediction)
+    if guesses:
+        return f"I'm not sure what happened. It might be: {guesses}."
+    return "I need a bit more information to know what happened."
 
 
 def likely_emergencies(prediction: Prediction, guidance: dict[str, Guidance]) -> list[str]:
@@ -143,10 +179,12 @@ def likely_emergencies(prediction: Prediction, guidance: dict[str, Guidance]) ->
 
 
 def best_guesses(prediction: Prediction) -> str:
-    """'burn (45%), small cut (30%), bruise (10%)'"""
+    """'burn (45%), small cut (30%)': injuries among the top guesses that are at least CAUTION_PROBABILITY likely.
+    Empty if there are none, so 'clarification (83%)' or 'bruise (2%)' is never offered as a guess."""
     guesses = []
     for label, probability in prediction.ranked[:TOP_GUESSES]:
-        guesses.append(f"{label} ({probability:.0%})")
+        if label not in NOT_A_DIAGNOSIS and probability >= CAUTION_PROBABILITY:
+            guesses.append(f"{label} ({probability:.0%})")
     return ", ".join(guesses)
 
 
