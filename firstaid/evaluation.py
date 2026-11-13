@@ -14,7 +14,6 @@ class LabelScore:
     label: str
     precision: float    # when the model says this label, how often it is right
     recall: float       # of the sentences that really have this label, how many it found
-    f1: float           # precision and recall combined into one number
     sentences: int      # how many test sentences have this label
 
 
@@ -58,12 +57,12 @@ def feedback_report(probabilities: np.ndarray, true_labels: np.ndarray, texts: l
 
 def _score_each_label(true_labels: np.ndarray, predicted_labels: np.ndarray, labels: list[str]) -> list[LabelScore]:
     label_ids = list(range(len(labels)))
-    precisions, recalls, f1_scores, sentence_counts = precision_recall_fscore_support(
+    precisions, recalls, _, sentence_counts = precision_recall_fscore_support(
         true_labels, predicted_labels, labels=label_ids, zero_division=0)
     scores = []
     for label_number, label in enumerate(labels):
         scores.append(LabelScore(label, float(precisions[label_number]), float(recalls[label_number]),
-                                 float(f1_scores[label_number]), int(sentence_counts[label_number])))
+                                 int(sentence_counts[label_number])))
     return scores
 
 
@@ -140,10 +139,10 @@ def _accuracy_section(train_accuracy: float, train_size: int, cv_accuracy: float
 
 def _per_label_section(scores: list[LabelScore], width: int) -> list[str]:
     lines = ["Per label (test set)",
-             f"  {'label':<{width}}  precision  recall     f1  sentences"]
+             f"  {'label':<{width}}  precision  recall  sentences"]
     for score in scores:
         lines.append(f"  {score.label:<{width}}  {score.precision:9.0%}  {score.recall:6.0%}  "
-                     f"{score.f1:5.0%}  {score.sentences:9d}")
+                     f"{score.sentences:9d}")
     return lines
 
 

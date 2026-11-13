@@ -80,6 +80,60 @@ python chat.py "my friend is choking on bread"   # answer one message and exit
 To change which values tuning tries, edit `SEARCH_SPACE` in `firstaid/training.py`. To change the
 defaults (including `label_smoothing`, which is not tuned), edit `HyperParams` in the same file.
 
+## Reading the training report (`artifacts/training_report.txt`)
+
+`train.py` keeps the sentences marked `test` in Sheet1 aside and never trains on them. The report
+shows how the model does on those unseen sentences, which is the honest measure of quality.
+
+### Accuracy
+
+| Line | Meaning |
+|---|---|
+| training data | score on the sentences it learned from; near 100% is normal and proves little |
+| cross-validation | estimate made during tuning, on parts of the training split held back in turn |
+| test data | share of unseen test sentences labelled correctly; **the number that matters** |
+
+A big gap between training (high) and test (low) means the model memorised its sentences instead of
+learning the pattern (overfitting).
+
+### Per label (test set)
+
+| Column | Question it answers | Formula |
+|---|---|---|
+| precision | When the model says X, how often is it right? | correct X ÷ times it predicted X |
+| recall | Of all sentences that really are X, how many did it find? | correct X ÷ sentences that really are X |
+| sentences | how many test sentences have this label | |
+
+- Low **recall**: the model misses this label and calls it something else.
+- Low **precision**: the model uses this label too often, for sentences that belong elsewhere.
+- For emergencies (severe bleeding, choking, allergic reaction, broken bone, head injury) **recall
+  matters most**: a missed emergency is worse than a minor case flagged as urgent.
+- With few test sentences per label, one mistake moves a score a lot (with 2 sentences, recall can
+  only be 0%, 50% or 100%).
+
+### Confusion matrix
+
+```
+                     0  1  2  3 ...
+   0 burn            6  .  .  .        rows    = the true label
+   1 small cut       1  4  .  .        columns = what the model predicted (same numbers as the rows)
+   3 sprain          .  .  .  5  ...   . means 0
+```
+
+- Each number is a **count of test sentences**: row X, column Y = "really X, predicted as Y".
+- The **diagonal** (top-left to bottom-right) holds the correct answers.
+- Anything **off the diagonal** is a mistake and shows which labels get mixed up. Above, one small
+  cut was predicted as burn (row 1, column 0).
+- Reading **across a row** gives recall; reading **down a column** gives precision.
+- Accuracy = sum of the diagonal ÷ sum of all cells.
+
+### Mistakes on the test set
+
+Every wrong test sentence with its true and predicted label and how sure the model was. Lines marked
+`[UNDER-TRIAGE]` are the dangerous ones: the prediction is **less urgent** than reality (for example a
+broken bone answered as a sprain, self-care instead of see a doctor). Fix these first, usually by
+adding more varied example sentences for the two labels it confuses.
+
 ## Chat options (`chat.py`)
 
 | Option | Default | What it does |
